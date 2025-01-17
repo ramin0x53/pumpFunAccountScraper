@@ -8,9 +8,43 @@ import (
 	"time"
 )
 
-const waitSleep = 5 * time.Microsecond
+type Queue[T any] struct {
+	elements []T
+	mu       sync.Mutex
+}
+
+func (q *Queue[T]) Enqueue(value T) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.elements = append(q.elements, value)
+}
+
+func (q *Queue[T]) Dequeue() (T, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if len(q.elements) == 0 {
+		var zeroValue T
+		return zeroValue, false
+	}
+
+	value := q.elements[0]
+	q.elements = q.elements[1:]
+	return value, true
+}
+
+type AccountResult struct {
+	Tokens  *[]api.Token
+	Account string
+}
+
+type Task struct {
+	Function func(string)
+	Argument string
+}
 
 type AccountScraper struct {
+	result   chan<- AccountResult
 	LastFind struct {
 		Date time.Time
 		mu   sync.Mutex
@@ -18,21 +52,33 @@ type AccountScraper struct {
 	accountsCache storage.Cache
 	tokensCache   storage.Cache
 	workers       struct {
-		workersLimit int64
-		workersNum   int64
-		mu           sync.Mutex
+		workersNum  int
+		workersChan chan Task
+		queue       Queue[Task]
 	}
 }
 
-func NewAccountScrapper(workersLimit int64, accountsCache storage.Cache, tokensCache storage.Cache) *AccountScraper {
-	return &AccountScraper{struct {
+func NewAccountScrapper(result chan<- AccountResult, workersNum int, accountsCache storage.Cache, tokensCache storage.Cache) *AccountScraper {
+	scraper := &AccountScraper{result, struct {
 		Date time.Time
 		mu   sync.Mutex
 	}{time.Now(), sync.Mutex{}}, accountsCache, tokensCache, struct {
-		workersLimit int64
-		workersNum   int64
-		mu           sync.Mutex
-	}{workersLimit, 0, sync.Mutex{}}}
+		workersNum  int
+		workersChan chan Task
+		queue       Queue[Task]
+	}{workersNum, make(chan Task), Queue[Task]{elements: []Task{}}}}
+	scraper.startWorkers()
+	go scraper.handleQueue()
+	return scraper
+}
+
+func (a *AccountScraper) handleQueue() {
+	for {
+		task, exist := a.workers.queue.Dequeue()
+		if exist {
+			a.workers.workersChan <- task
+		}
+	}
 }
 
 func (a *AccountScraper) registerLastFind() {
@@ -41,44 +87,24 @@ func (a *AccountScraper) registerLastFind() {
 	a.LastFind.Date = time.Now()
 }
 
-func (a *AccountScraper) incWorker() bool {
-	a.workers.mu.Lock()
-	defer a.workers.mu.Unlock()
-	if a.checkWorker() {
-		a.workers.workersNum++
-		return true
-	}
-	return false
-}
-
-func (a *AccountScraper) wait() {
-	for !a.incWorker() {
-		time.Sleep(waitSleep)
+func (a *AccountScraper) worker() {
+	for work := range a.workers.workersChan {
+		work.Function(work.Argument)
 	}
 }
 
-func (a *AccountScraper) decWorker() {
-	a.workers.mu.Lock()
-	defer a.workers.mu.Unlock()
-	if a.workers.workersNum > 0 {
-		a.workers.workersNum--
-	}
-}
-
-func (a *AccountScraper) checkWorker() bool {
-	if a.workers.workersNum < a.workers.workersLimit {
-		return true
-	} else {
-		return false
+func (a *AccountScraper) startWorkers() {
+	for i := 0; i < a.workers.workersNum; i++ {
+		go a.worker()
 	}
 }
 
 func (a *AccountScraper) ScrapeAccount(account string) {
-	defer a.decWorker()
 
 	allow, err := a.accountAllowed(account)
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
+		return
 	}
 
 	if !allow {
@@ -87,28 +113,29 @@ func (a *AccountScraper) ScrapeAccount(account string) {
 
 	tokens, err := api.GetAccountTokens(account)
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
+		return
 	}
 
 	err = a.accountsCache.AddKey(account, "1")
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
+		return
 	}
 
-	//TODO: should send a result to channel with tokens
+	a.result <- AccountResult{tokens, account}
 
 	for _, token := range *tokens {
-		a.wait()
-		go a.ScrapeToken(token.Mint)
+		a.workers.queue.Enqueue(Task{a.ScrapeToken, token.Mint})
 	}
 }
 
 func (a *AccountScraper) ScrapeToken(token string) {
-	defer a.decWorker()
 
 	allow, err := a.tokenAllowed(token)
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
+		return
 	}
 
 	if !allow {
@@ -117,17 +144,18 @@ func (a *AccountScraper) ScrapeToken(token string) {
 
 	trades, err := api.GetTokenTrades(token)
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
+		return
 	}
 
 	err = a.tokensCache.AddKey(token, "1")
 	if err != nil {
-		log.Panic(err)
+		log.Println(err)
+		return
 	}
 
 	for _, trade := range *trades {
-		a.wait()
-		go a.ScrapeAccount(trade.User)
+		a.workers.queue.Enqueue(Task{a.ScrapeAccount, trade.User})
 	}
 }
 
